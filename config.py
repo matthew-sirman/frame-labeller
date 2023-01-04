@@ -4,6 +4,9 @@ Configuration.
 Contains global variables defining the configuration of the predictor.
 """
 
+# General
+USE_CUDA_IF_AVAILABLE = True
+
 # Dataset sources
 EDS_SOURCES_DIR = "../DeepBank"
 SEMLINK_DATA_FILE = "../1.2.2c.okay.txt"

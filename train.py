@@ -7,6 +7,10 @@ from model import FrameLabeller
 import loader
 
 
+CUDA = torch.cuda.is_available() and cfg.USE_CUDA_IF_AVAILABLE
+DEVICE = "cuda" if CUDA else "cpu"
+
+
 def load_model_from_cfg(semlinks):
     """
     Load a FrameLabeller instance using the config model parameters.
@@ -23,6 +27,8 @@ def load_model_from_cfg(semlinks):
                           cfg.MODEL_HIDDEN_NODE_FEATURE_SIZE,
                           cfg.MODEL_OUTPUT_EMBEDDING_SIZE,
                           cfg.MODEL_SUBGRAPH_HOPS)
+
+    model.to(DEVICE)
 
     return model
 

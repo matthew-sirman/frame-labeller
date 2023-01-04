@@ -8,6 +8,10 @@ from torch_geometric.utils import k_hop_subgraph
 import config as cfg
 
 
+CUDA = torch.cuda.is_available() and cfg.USE_CUDA_IF_AVAILABLE
+DEVICE = "cuda" if CUDA else "cpu"
+
+
 def convert_eds_to_graph(eds_data, predicate2ix, attr2ix):
     """
     Take an EDS object and construct a PyTorch graph.
@@ -51,6 +55,7 @@ def convert_eds_to_graph(eds_data, predicate2ix, attr2ix):
     edge_attrs = torch.tensor(attrs, dtype=torch.long)
 
     graph = Data(x=nodes, edge_index=edges, edge_attr=edge_attrs)
+    graph.to(DEVICE)
     top_node = node2ix[eds_data.top]
 
     return graph, top_node, root_args
