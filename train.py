@@ -223,19 +223,6 @@ def train_model():
 
     save_model_params(model)
 
-    print("Evaluating model on train set")
-
-    semlinks.activate_train_set()
-
-    root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
-    print(f"Root accuracy: {root_acc}")
-    print(f"Frame accuracy: {frame_acc}")
-    print(f"Role accuracy: {role_acc}")
-    print(f"Frame F_1 score: {frame_f(1)}, F_0.5 score: {frame_f(0.5)}")
-    print(f"Role F_1 score: {role_f(1)}, F_0.5 score: {role_f(0.5)}")
-    print()
-    print("Evaluating model on development set")
-
     semlinks.activate_dev_set()
 
     root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
