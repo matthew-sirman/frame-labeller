@@ -24,9 +24,7 @@ def load_model_from_cfg(semlinks):
     model = FrameLabeller(semlinks,
                           cfg.MODEL_EMBEDDING_SIZE,
                           cfg.MODEL_ATTENTION_HEADS,
-                          cfg.MODEL_HIDDEN_NODE_FEATURE_SIZE,
-                          cfg.MODEL_OUTPUT_EMBEDDING_SIZE,
-                          cfg.MODEL_SUBGRAPH_HOPS)
+                          cfg.MODEL_HIDDEN_NODE_FEATURE_SIZE)
 
     model.to(DEVICE)
 
@@ -34,6 +32,12 @@ def load_model_from_cfg(semlinks):
 
 
 def load_model_params(model):
+    """
+    Load model data from path in config file.
+
+    Parameters:
+    model (FrameLabeller): Model to load parameters into
+    """
     model_path = cfg.LOAD_MODEL
 
     if model_path is None:
@@ -43,21 +47,26 @@ def load_model_params(model):
 
 
 def save_model_params(model):
+    """
+    Save model data to path in config file.
+
+    Parameters:
+    model (FrameLabeller): Model to save parameters from
+    """
     model_path = cfg.SAVE_MODEL
 
     if model_path is None:
         print("WARNING: Model not saved! No path given")
+        return
 
     os.makedirs(model_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(model_path, cfg.MODEL_NAME))
 
 
 def evaluate(semlinks, model):
-    """Evaluate model on development set."""
-    semlinks.activate_dev_set()
-
-    frame_scores = {frame: {"tp": 0, "tn": 0, "fp": 0, "fn": 0} for frame in semlinks.ix2frame}
-    role_scores = {role: {"tp": 0, "tn": 0, "fp": 0, "fn": 0} for role in semlinks.ix2role}
+    """Evaluate model."""
+    frame_scores = {frame: {"tp": 0, "tn": 0, "fp": 0, "fn": 0, "support": 0} for frame in semlinks.ix2frame}
+    role_scores = {role: {"tp": 0, "tn": 0, "fp": 0, "fn": 0, "support": 0} for role in semlinks.ix2role}
 
     def update_scores(score_dict, true, pred):
         for entry in score_dict:
@@ -74,32 +83,42 @@ def evaluate(semlinks, model):
                 else:
                     score_dict[entry]["tn"] += 1
 
+    root_accuracy = 0
     frame_accuracy = 0
     role_accuracy = 0
     role_total = 0
 
-    for eds_data, (true_frame, true_roles) in semlinks:
-        pred_frame, pred_roles = model(eds_data)
+    for i in range(len(semlinks)):
+        feature, true_root, true_frame, true_roles = semlinks[i]
+        (pred_root, pred_frame), pred_roles = model(feature)
 
+        pred_root = torch.argmax(pred_root)
         pred_frame = torch.argmax(pred_frame)
-        pred_roles = {role: torch.argmax(pred_roles[role]) for role in pred_roles}
+        pred_roles = torch.argmax(pred_roles, dim=1)
+
+        frame_scores[true_frame.item()]["support"] += 1
+
+        if pred_root == true_root:
+            root_accuracy += 1
 
         update_scores(frame_scores, true_frame, pred_frame)
-
         if pred_frame == true_frame:
             frame_accuracy += 1
 
-        for arg in true_roles:
-            update_scores(role_scores, true_roles[arg], pred_roles[arg])
-            if true_roles[arg] == pred_roles[arg]:
+        adjacent_edges = torch.argwhere(feature["edge-in"].edge_index[0] == pred_root)
+        for edge in adjacent_edges:
+            update_scores(role_scores, true_roles[edge], pred_roles[edge])
+            if true_roles[edge] == pred_roles[edge]:
                 role_accuracy += 1
             role_total += 1
+            role_scores[true_roles[edge].item()]["support"] += 1
 
+    root_accuracy /= len(semlinks)
     frame_accuracy /= len(semlinks)
     role_accuracy /= role_total
 
-    def f_score(beta, scores):
-        f = 0
+    def f_score(beta, scores, size):
+        avg_f = 0
         for entry in scores:
             tp = scores[entry]["tp"]
             fp = scores[entry]["fp"]
@@ -108,17 +127,19 @@ def evaluate(semlinks, model):
             r = tp / (tp + fn) if tp + fn != 0 else 0
 
             d = beta * beta * p + r
-            f += (1 + beta * beta) * (p * r) / d if d != 0 else 0
+            f = (1 + beta * beta) * (p * r) / d if d != 0 else 0
+            weight = scores[entry]["support"] / size
+            avg_f += f * weight
 
-        return f / len(scores)
+        return avg_f
 
     def frame_f_score(beta):
-        return f_score(beta, frame_scores)
+        return f_score(beta, frame_scores, len(semlinks))
 
     def role_f_score(beta):
-        return f_score(beta, role_scores)
+        return f_score(beta, role_scores, role_total)
 
-    return frame_accuracy, role_accuracy, frame_f_score, role_f_score
+    return root_accuracy, frame_accuracy, role_accuracy, frame_f_score, role_f_score
 
 
 def train_model():
@@ -134,40 +155,48 @@ def train_model():
     optim = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
 
     loss_fn = nn.NLLLoss()
+    role_loss_fn = nn.NLLLoss(semlinks.compute_role_loss_weights())
 
     semlinks.view_data_indexed()
     semlinks.activate_train_set()
 
     steps = 0
     steps_loss = 0
+    steps_role_loss = 0
 
     for epoch in range(cfg.TRAIN_EPOCHS):
         epoch_loss = 0
+        epoch_role_loss = 0
 
-        for eds_data, (frame, roles) in semlinks:
+        for i in range(len(semlinks)):
+            feature, root_node, target_frame, target_roles = semlinks[i]
+            steps += 1
+
+            (pred_root, pred_frame), pred_roles = model(feature, root_node, teacher_force_ratio=0.5)
+
+            frame_loss = loss_fn(pred_root, root_node) + loss_fn(pred_frame, target_frame)
+            role_loss = role_loss_fn(pred_roles, target_roles)
+            loss = frame_loss + role_loss
+
             optim.zero_grad()
-
-            frame_preds, arg_preds = model(eds_data)
-
-            loss = loss_fn(frame_preds, frame)
-
-            for arg in arg_preds:
-                loss += loss_fn(arg_preds[arg], roles[arg])
-
             loss.backward()
             optim.step()
 
-            epoch_loss += loss
-            steps_loss += loss
+            epoch_loss += loss.item()
+            epoch_role_loss += role_loss.item()
+            steps_loss += loss.item()
+            steps_role_loss += role_loss.item()
 
-            steps += 1
             log_round_step = steps % cfg.TRAIN_LOG_PER_N_STEPS
             if cfg.TRAIN_LOG_PER_N_STEPS > 0 and log_round_step == 0:
                 avg_loss = steps_loss / cfg.TRAIN_LOG_PER_N_STEPS
+                avg_role_loss = steps_role_loss / cfg.TRAIN_LOG_PER_N_STEPS
 
-                print(f"Step {steps}. "
-                      f"Average loss: {avg_loss}")
+                print(f"Step {steps}/{len(semlinks) * cfg.TRAIN_EPOCHS}. "
+                      f"Average loss: {avg_loss} "
+                      f"Average role loss: {avg_role_loss}")
                 steps_loss = 0
+                steps_role_loss = 0
 
             save_round_step = steps % cfg.SAVE_AFTER_STEPS
             if cfg.SAVE_AFTER_STEPS > 0 and save_round_step == 0:
@@ -175,12 +204,16 @@ def train_model():
                 save_model_params(model)
 
         print(f"Epoch {epoch + 1}/{cfg.TRAIN_EPOCHS} complete. "
-              f"Average epoch loss: {epoch_loss / len(semlinks)}")
+              f"Average epoch loss: {epoch_loss / len(semlinks)} "
+              f"Average epoch role loss: {epoch_role_loss / len(semlinks)}")
 
         if (epoch + 1) % cfg.VALIDATE_AFTER_EPOCHS == 0:
             print("Evaluating model on development set")
 
-            frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
+            semlinks.activate_dev_set()
+
+            root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
+            print(f"Root accuracy: {root_acc}")
             print(f"Frame accuracy: {frame_acc}")
             print(f"Role accuracy: {role_acc}")
             print(f"Frame F_1 score: {frame_f(1)}, F_0.5 score: {frame_f(0.5)}")
@@ -189,3 +222,38 @@ def train_model():
             semlinks.activate_train_set()
 
     save_model_params(model)
+
+    print("Evaluating model on train set")
+
+    semlinks.activate_train_set()
+
+    root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
+    print(f"Root accuracy: {root_acc}")
+    print(f"Frame accuracy: {frame_acc}")
+    print(f"Role accuracy: {role_acc}")
+    print(f"Frame F_1 score: {frame_f(1)}, F_0.5 score: {frame_f(0.5)}")
+    print(f"Role F_1 score: {role_f(1)}, F_0.5 score: {role_f(0.5)}")
+    print()
+    print("Evaluating model on development set")
+
+    semlinks.activate_dev_set()
+
+    root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
+    print(f"Root accuracy: {root_acc}")
+    print(f"Frame accuracy: {frame_acc}")
+    print(f"Role accuracy: {role_acc}")
+    print(f"Frame F_1 score: {frame_f(1)}, F_0.5 score: {frame_f(0.5)}")
+    print(f"Role F_1 score: {role_f(1)}, F_0.5 score: {role_f(0.5)}")
+    print()
+
+    print("Evaluating model on test set")
+
+    semlinks.activate_test_set()
+
+    root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)
+
+    print(f"Root accuracy: {root_acc}")
+    print(f"Frame accuracy: {frame_acc}")
+    print(f"Role accuracy: {role_acc}")
+    print(f"Frame F_1 score: {frame_f(1)}, F_0.5 score: {frame_f(0.5)}")
+    print(f"Role F_1 score: {role_f(1)}, F_0.5 score: {role_f(0.5)}")

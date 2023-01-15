@@ -1,64 +1,17 @@
+import random
+
+import delphin.codecs.eds as eds
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, HGTConv, aggr
-from torch_geometric.data import Data, HeteroData
-from torch_geometric.utils import k_hop_subgraph
 
 import config as cfg
+from loader import convert_eds_to_hetero_graph
 
 
 CUDA = torch.cuda.is_available() and cfg.USE_CUDA_IF_AVAILABLE
 DEVICE = "cuda" if CUDA else "cpu"
-
-
-def convert_eds_to_graph(eds_data, predicate2ix, attr2ix):
-    """
-    Take an EDS object and construct a PyTorch graph.
-
-    Parameters:
-    eds_data (EDS): EDS object to create a graph for
-    predicate2ix (dict): Lookup for predicate names
-    attr2ix (dict): Lookup for attribute names
-
-    Returns:
-    graph (Data): PyTorch graph representation
-    top_node (int): Index of root node
-    root_args (set): Root node argument names and corresponding nodes
-    """
-    nodes = []
-    node2ix = {}
-
-    for node in eds_data.nodes:
-        node2ix[node.id] = len(node2ix)
-        nodes.append(predicate2ix[node.predicate])
-
-    sources, targets = [], []
-    attrs = []
-    for node in eds_data.nodes:
-        for attr, neighbour in node.edges.items():
-            if attr in cfg.IGNORE_ATTRS:
-                continue
-
-            sources.append(node2ix[node.id])
-            targets.append(node2ix[neighbour])
-            attrs.append(attr2ix[attr])
-
-    root_args = set()
-    for arg_name, n in eds_data[eds_data.top].edges.items():
-        if arg_name in cfg.IGNORE_ATTRS:
-            continue
-        root_args.add((arg_name, node2ix[n]))
-
-    nodes = torch.tensor(nodes, dtype=torch.long)
-    edges = torch.tensor([sources, targets], dtype=torch.long)
-    edge_attrs = torch.tensor(attrs, dtype=torch.long)
-
-    graph = Data(x=nodes, edge_index=edges, edge_attr=edge_attrs)
-    graph.to(DEVICE)
-    top_node = node2ix[eds_data.top]
-
-    return graph, top_node, root_args
 
 
 class FrameLabeller(nn.Module):
@@ -70,9 +23,7 @@ class FrameLabeller(nn.Module):
     """
 
     def __init__(self, semlink_dataset,
-                 embedding_size=100, heads=1, hidden_node_feature_size=100,
-                 output_embedding_size=50,
-                 subgraph_hops=3):
+                 embedding_size=100, heads=1, hidden_node_feature_size=100):
         """
         Create a frame labeller model.
 
@@ -83,43 +34,30 @@ class FrameLabeller(nn.Module):
         heads (int): Attention heads for GATConv layer
         hidden_node_feature_size (int): Output size for first GNN layer
         output_embedding_size (int): Output size of final GNN layers
-        subgraph_hops (int): Reachable lookahead of argument subgraphs
         """
         super(FrameLabeller, self).__init__()
         self.predicate2ix = semlink_dataset.predicate2ix
         self.attr2ix = semlink_dataset.attr2ix
         self.ix2frame = semlink_dataset.ix2frame
         self.ix2role = semlink_dataset.ix2role
-        self.subgraph_hops = subgraph_hops
-        self.predicate_embedding = nn.Embedding(len(self.predicate2ix),
-                                                embedding_size)
+        self.hidden_size = hidden_node_feature_size
+
+        self.predicate_embedding = nn.Embedding(len(self.predicate2ix), embedding_size)
         self.attr_embedding = nn.Embedding(len(self.attr2ix), embedding_size)
 
-        self.gnn = GATv2Conv(embedding_size,
-                             hidden_node_feature_size,
-                             edge_dim=embedding_size,
-                             heads=heads)
+        self.gnn = HGTConv(embedding_size, hidden_node_feature_size,
+                           (["node", "edge"], [("node", "true-edge", "node"),
+                                               ("node", "edge-in", "edge"),
+                                               ("edge", "edge-out", "node")]),
+                           heads=heads)
 
-        self.arg_gnn = GATv2Conv(hidden_node_feature_size * heads,
-                                 hidden_node_feature_size,
-                                 edge_dim=embedding_size,
-                                 heads=heads)
+        self.aggregate_graph = aggr.SoftmaxAggregation()
 
-        self.aggregate_arg = aggr.SoftmaxAggregation()
+        self.root_node_predict = GATv2Conv(hidden_node_feature_size, 1, edge_dim=hidden_node_feature_size)
+        self.frame_predict = nn.Linear(hidden_node_feature_size * 2, len(self.ix2frame))
+        self.role_predict = nn.Linear(hidden_node_feature_size * 2, len(self.ix2role))
 
-        self.output_gnn = HGTConv(-1,
-                                  output_embedding_size,
-                                  (["frame", "role"],
-                                   [("frame", "f-loop", "frame"),
-                                    ("frame", "edge", "role"),
-                                    ("role", "r-loop", "role")]))
-
-        self.frame_predict = nn.Linear(output_embedding_size,
-                                       len(self.ix2frame))
-        self.role_predict = nn.Linear(output_embedding_size,
-                                      len(self.ix2role))
-
-    def forward(self, eds_data, eds_graph=None, eds_root=None, eds_args=None):
+    def forward(self, eds_graph, teacher_target=None, teacher_force_ratio=0.5):
         """
         Forward pass through model.
 
@@ -133,81 +71,72 @@ class FrameLabeller(nn.Module):
         frame (Tensor): Frame predictions (one-hot)
         args (dict): Argument predictions (one-hot)
         """
-        if eds_graph is None:
-            eds_data = convert_eds_to_graph(eds_data,
-                                            self.predicate2ix,
-                                            self.attr2ix)
-            eds_graph, eds_root, eds_args = eds_data
+        if isinstance(eds_graph, eds.EDS):
+            eds_graph, ix2node = convert_eds_to_hetero_graph(eds_graph, self.predicate2ix, self.attr2ix)
 
-        p_embeddings = self.predicate_embedding(eds_graph.x)
-        a_embeddings = self.predicate_embedding(eds_graph.edge_attr)
+        p_embeddings = self.predicate_embedding(eds_graph["node"].x)
+        a_embeddings = self.predicate_embedding(eds_graph["edge"].x)
 
-        node_embeddings = self.gnn(x=p_embeddings,
-                                   edge_index=eds_graph.edge_index,
-                                   edge_attr=a_embeddings)
+        hidden = self.gnn({"node": p_embeddings, "edge": a_embeddings}, eds_graph.edge_index_dict)
+        root_hidden_nodes = hidden["node"]
+        frame_hidden_nodes = hidden["node"]
+        role_hidden_nodes = hidden["node"]
+        root_hidden_edges = hidden["edge"]
+        frame_hidden_edges = hidden["edge"]
+        role_hidden_edges = hidden["edge"]
 
-        intermediate_graph = Data(x=node_embeddings,
-                                  edge_index=eds_graph.edge_index,
-                                  edge_attr=a_embeddings)
+        root_preds = self.root_node_predict(x=root_hidden_nodes,
+                                            edge_index=eds_graph["node", "true-edge", "node"].edge_index,
+                                            edge_attr=root_hidden_edges)
+        root_preds = F.log_softmax(root_preds, dim=0).squeeze(1)
 
-        induced_subgraph = HeteroData()
+        graph_node_rep = self.aggregate_graph(frame_hidden_nodes)
+        graph_edge_rep = self.aggregate_graph(frame_hidden_edges)
+        graph_rep = torch.cat((graph_node_rep, graph_edge_rep), 1)
 
-        induced_subgraph["frame"].x = self.aggregate_arg(node_embeddings)
-        induced_subgraph["role"].x = torch.zeros(len(eds_args),
-                                                 node_embeddings.size(1))
+        frame_preds = F.log_softmax(self.frame_predict(graph_rep), dim=1).squeeze(0)
 
-        induced_edges = torch.zeros(2, len(eds_args), dtype=torch.long)
+        graph_role_rep = self.aggregate_graph(role_hidden_nodes).repeat(role_hidden_edges.size(0), 1)
+        role_preds = self.role_predict(torch.cat((role_hidden_edges, graph_role_rep), dim=1))
 
-        arg_lookup = dict(eds_args)
+        if teacher_target is not None and random.random() < teacher_force_ratio:
+            non_adjacent_edges = torch.argwhere(eds_graph["edge-in"].edge_index[0] != teacher_target)
+        else:
+            non_adjacent_edges = torch.argwhere(eds_graph["edge-in"].edge_index[0] != torch.argmax(root_preds))
 
-        for i, (arg_name, eds_arg) in enumerate(eds_args):
-            node_subset = k_hop_subgraph(eds_arg,
-                                         self.subgraph_hops,
-                                         eds_graph.edge_index)[0]
-            subgraph = intermediate_graph.subgraph(node_subset)
-            arg_outputs = self.arg_gnn(x=subgraph.x,
-                                       edge_index=subgraph.edge_index,
-                                       edge_attr=subgraph.edge_attr)
-            induced_subgraph["role"].x[i] = self.aggregate_arg(arg_outputs)
-            induced_edges[1, i] = i
-            arg_lookup[arg_name] = i
+        role_preds[non_adjacent_edges] = 0
+        role_preds = F.log_softmax(role_preds, dim=1)
 
-        frame_loop = torch.tensor([[0], [0]]).long()
-        arg_index_list = [i for i in range(len(eds_args))]
-        arg_loops = torch.tensor([arg_index_list, arg_index_list]).long()
-        induced_subgraph["frame", "f-loop", "frame"].edge_index = frame_loop
-        induced_subgraph["role", "r-loop", "role"].edge_index = arg_loops
-        induced_subgraph["frame", "edge", "role"].edge_index = induced_edges
+        return (root_preds, frame_preds), role_preds
 
-        output = self.output_gnn(induced_subgraph.x_dict,
-                                 induced_subgraph.edge_index_dict)
-
-        frame = F.log_softmax(self.frame_predict(output["frame"]), dim=1)
-        roles = F.log_softmax(self.role_predict(output["role"]), dim=1)
-
-        args = {}
-
-        for role_arg in arg_lookup:
-            args[role_arg] = roles[arg_lookup[role_arg]]
-
-        return frame[0], args
-
-    def predict(self, eds_data, eds_graph=None, eds_root=None, eds_args=None):
+    def predict(self, eds_graph, ix2node=None):
         """
         Predict output classes instead of one-hot prediction tensors.
 
         Parameters:
-        eds_data (EDS): EDS graph to predict on
-        eds_graph (Data): Precomputed PyTorch data graph
-        eds_root (int): Precomputed root node
-        eds_args (set): Precomputed arg/attr set
+        eds_graph (Data or EDS): EDS graph to predict on
+        ix2node (dict): Mapping from graph indices to nodes
 
         Returns:
-        frame (str): Frame prediction
-        args (dict): Arg predictions
+        root (str): Graph node to annotate the frame onto
+        frame (str): Frame to annotate
+        args (dict): Predicted roles
         """
-        frame, args = self.forward(eds_data, eds_graph, eds_root, eds_args)
-        frame = self.ix2frame[torch.argmax(frame).item()]
-        args = {arg: self.ix2role[torch.argmax(args[arg]).item()] for arg in args}
+        if isinstance(eds_graph, eds.EDS):
+            eds_graph, ix2node = convert_eds_to_hetero_graph(eds_graph, self.predicate2ix, self.attr2ix)
 
-        return frame, args
+        (root_preds, frame_preds), role_preds = self.forward(eds_graph)
+        root_preds = torch.argmax(root_preds, dim=0)
+        frame_preds = torch.argmax(frame_preds, dim=0)
+        role_preds = torch.argmax(role_preds, dim=1)
+
+        root = ix2node[root_preds.item()]
+        frame = self.ix2frame[frame_preds.item()]
+
+        roles = []
+        for i, edge in enumerate(role_preds):
+            if edge.item() != 0:
+                s, t = eds_graph["node", "true-edge", "node"].edge_index[:, i]
+                roles.append((ix2node[s.item()], ix2node[t.item()], self.ix2role[edge.item()]))
+
+        return (root, frame), roles
