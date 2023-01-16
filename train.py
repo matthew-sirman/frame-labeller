@@ -223,6 +223,8 @@ def train_model():
 
     save_model_params(model)
 
+    print("Evaluating model on development set")
+
     semlinks.activate_dev_set()
 
     root_acc, frame_acc, role_acc, frame_f, role_f = evaluate(semlinks, model)

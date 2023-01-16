@@ -357,8 +357,8 @@ def create_predicate_and_attribute_indices(eds_dataset):
     predicate2ix (dict): Mappings from predicate names to indices
     attr2ix (dict): Mappings from attribute names to indices
     """
-    predicate2ix = {}
-    attr2ix = {}
+    predicate2ix = {"<UNK>": 0}
+    attr2ix = {"<UNK>": 0}
 
     for eds_data in eds_dataset:
         for node in eds_data.nodes:
@@ -407,7 +407,7 @@ def create_frame_and_role_indices(semlink_dataset):
     return frame2ix, ix2frame, role2ix, ix2role
 
 
-def connect_eds_to_semlink(eds_dataset, deepbank_ptb_lookup, semlink_lookup):
+def connect_eds_to_semlink(eds_dataset, deepbank_ptb_lookup, semlink_lookup, return_unlinked=False):
     """
     Pair entries in the SemLink database to EDS graphs.
 
@@ -423,19 +423,22 @@ def connect_eds_to_semlink(eds_dataset, deepbank_ptb_lookup, semlink_lookup):
     for k, v in deepbank_ptb_lookup.items():
         sentence_to_ptb[k.replace(" ", "")] = v
 
+    unlinked_eds = []
     annotated_eds = []
 
     for i, (eds_file_name, entry) in enumerate(eds_dataset):
-        raw_sentence, token_positions, eds_data = extract_relevant_from_eds_document(entry)
+        raw_sentence, token_positions, eds_raw_data = extract_relevant_from_eds_document(entry)
 
         key = raw_sentence.replace(" ", "")
         if key not in sentence_to_ptb:
+            unlinked_eds.append((eds_file_name, eds_raw_data))
             continue
 
         wsj, sentence_id, ix2token = sentence_to_ptb[key]
         ix2token = dict(ix2token)
 
         if (wsj, sentence_id) not in semlink_lookup:
+            unlinked_eds.append((eds_file_name, eds_raw_data))
             continue
 
         annotations = semlink_lookup[wsj, sentence_id]
@@ -454,11 +457,13 @@ def connect_eds_to_semlink(eds_dataset, deepbank_ptb_lookup, semlink_lookup):
                 else:
                     token_positions[0] = db_word, pos
         except ValueError:
+            unlinked_eds.append((eds_file_name, eds_raw_data))
             continue
 
         try:
-            eds_data = eds.decode(eds_data)
+            eds_data = eds.decode(eds_raw_data)
         except eds.EDSSyntaxError:
+            unlinked_eds.append((eds_file_name, eds_raw_data))
             continue
 
         node_intervals = IntervalTree()
@@ -533,9 +538,13 @@ def connect_eds_to_semlink(eds_dataset, deepbank_ptb_lookup, semlink_lookup):
                 matched_eds_annotated_edges[node.id, neighbour_node.id] = fn_role
 
         if roles_exist_in_semlink and len(matched_eds_annotated_edges) == 0:
+            unlinked_eds.append((eds_file_name, eds_raw_data))
             continue
 
-        annotated_eds.append((eds_data, matched_frames, matched_eds_annotated_edges))
+        annotated_eds.append((eds_file_name, eds_data, matched_frames, matched_eds_annotated_edges))
+
+    if return_unlinked:
+        return annotated_eds, unlinked_eds
 
     return annotated_eds
 
@@ -581,7 +590,11 @@ def convert_eds_to_hetero_graph(eds_data, predicate2ix, attr2ix,
         node2ix[node.id] = ix
         ix2node[ix] = node.id
 
-        nodes.append(predicate2ix[node.predicate])
+        if node.predicate in predicate2ix:
+            nodes.append(predicate2ix[node.predicate])
+        else:
+            nodes.append(0)
+
         if create_target:
             if node.id in frame_map:
                 frames.append(frame2ix[frame_map[node.id]])
@@ -599,16 +612,13 @@ def convert_eds_to_hetero_graph(eds_data, predicate2ix, attr2ix,
             target = node2ix[neighbour]
             node_node_sources.append(source)
             node_node_targets.append(target)
-            # node_node_targets.append(source)
-            # node_node_sources.append(target)
 
             edge_id = len(edges)
-            edges.append(attr2ix[attr])
+            if attr in attr2ix:
+                edges.append(attr2ix[attr])
+            else:
+                edges.append(0)
 
-            # edge_node_sources.append(edge_id)
-            # edge_node_targets.append(source)
-            # edge_node_sources.append(edge_id)
-            # edge_node_targets.append(target)
             node_edge_sources.append(source)
             node_edge_targets.append(edge_id)
             edge_node_sources.append(edge_id)
@@ -656,7 +666,8 @@ class SemLinkDataset(Dataset):
                  dev_split=None,
                  test_split=None,
                  shuffle=True,
-                 pre_compute_torch=True):
+                 pre_compute_torch=True,
+                 record_unlinked=False):
         """
         Construct a SemLink dataset.
 
@@ -682,14 +693,22 @@ class SemLinkDataset(Dataset):
         else:
             sentence_to_ptb = load_penn_treebank(parse_load_path)
 
-        self.eds_dataset = connect_eds_to_semlink(eds_dataset, sentence_to_ptb, semlink_lookup)
+        eds_dataset = connect_eds_to_semlink(eds_dataset,
+                                             sentence_to_ptb,
+                                             semlink_lookup,
+                                             record_unlinked)
+
+        if record_unlinked:
+            self.eds_dataset, self.eds_unlinked = eds_dataset
+        else:
+            self.eds_dataset = eds_dataset
 
         print(f"Loaded {len(self.eds_dataset)} datapoints.")
 
         if shuffle:
             random.shuffle(self.eds_dataset)
 
-        eds_graphs = [entry[0] for entry in self.eds_dataset]
+        eds_graphs = [entry[1] for entry in self.eds_dataset]
         indices = create_predicate_and_attribute_indices(eds_graphs)
         self.predicate2ix, self.attr2ix = indices
 
@@ -747,7 +766,7 @@ class SemLinkDataset(Dataset):
 
     def __pre_compute(self):
         pre_computed = []
-        for eds_data, (root_node, frame), roles in self.eds_dataset:
+        for _, eds_data, (root_node, frame), roles in self.eds_dataset:
             pre_computed.append(self.__pre_compute_single(eds_data,
                                                           root_node,
                                                           frame,
@@ -800,13 +819,13 @@ class SemLinkDataset(Dataset):
             return self.__pre_computed[index]
 
         if self.__view_indexed:
-            eds_data, (root_node, frame), roles = self.eds_dataset[index]
+            _, eds_data, (root_node, frame), roles = self.eds_dataset[index]
             return self.__pre_compute_single(eds_data,
                                              root_node,
                                              frame,
                                              roles)
 
-        eds_graph, frame, roles = self.eds_dataset[index]
+        _, eds_graph, frame, roles = self.eds_dataset[index]
 
         x = eds_graph
         y = frame, roles
@@ -855,4 +874,6 @@ def construct_semlink_dataset_from_config():
                           cfg.TRAIN_SPLIT,
                           cfg.DEV_SPLIT,
                           cfg.TEST_SPLIT,
-                          cfg.SHUFFLE_BEFORE_SPLITTING)
+                          cfg.SHUFFLE_BEFORE_SPLITTING,
+                          True,
+                          cfg.GENERATE_RESOURCE)

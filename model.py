@@ -92,6 +92,9 @@ class FrameLabeller(nn.Module):
 
         graph_node_rep = self.aggregate_graph(frame_hidden_nodes)
         graph_edge_rep = self.aggregate_graph(frame_hidden_edges)
+        if graph_edge_rep.size(0) == 0:
+            graph_edge_rep = torch.zeros_like(graph_node_rep)
+
         graph_rep = torch.cat((graph_node_rep, graph_edge_rep), 1)
 
         frame_preds = F.log_softmax(self.frame_predict(graph_rep), dim=1).squeeze(0)
